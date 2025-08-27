@@ -429,6 +429,38 @@ class FrankenPotential(torch.nn.Module):
         if add_energy_shift:
             energy = energy + self.energy_shift(data.atomic_numbers)
         return energy, forces
+    
+    def energy_and_forces_from_fmaps_bayesian(
+        self,
+        data: Configuration,
+        energy_fmap: torch.Tensor,
+        forces_fmap: torch.Tensor,
+        weights_mean: Optional[torch.Tensor] = None,
+        weights_sigma: Optional[torch.Tensor] = None,
+        add_energy_shift: bool = True,
+    ):
+        if weights_mean is None:
+            weights_mean = self.rf.weights
+        
+        X_eng = data.natoms * energy_fmap
+        energy_mean = torch.tensordot(
+            weights_mean,
+            X_eng,
+            dims=([1], [0]),  # type: ignore
+        )
+        X_forces = data.natoms * forces_fmap.view(forces_fmap.shape[0], -1, 3)
+        forces_mean = torch.tensordot(
+            weights_mean,
+            X_forces,
+            dims=([1], [0]),  # type: ignore
+        )
+
+        energy_sigma =  torch.einsum('fi,fg,fi->i', X_eng, weights_sigma, X_eng)
+        forces_var = torch.einsum('fac,fg,fbd->abd', X_forces, weights_sigma, X_forces)
+
+        if add_energy_shift:
+            energy = energy + self.energy_shift(data.atomic_numbers)
+        return energy_mean, forces_mean, energy_sigma, forces_var
 
     def forward(
         self,

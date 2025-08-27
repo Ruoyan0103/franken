@@ -166,7 +166,7 @@ def run_autotune(
             jac_chunk_size=jac_chunk_size,
         )
 
-        logs, weights = trainer.fit(model, solver_param_grid)
+        logs, weights = trainer.fit(model, solver_param_grid) 
         for split_name, loader in loaders.items():
             logs = trainer.evaluate(
                 model,
@@ -187,6 +187,72 @@ def run_autotune(
         if dist_utils.get_rank() == 0:
             if trainer.log_dir is not None:
                 trainer.serialize_logs(model, logs, weights, split_for_best_model)
+        dist_utils.barrier()
+
+        # current best model update
+        if dist_utils.get_rank() == 0:
+            if trainer.log_dir is not None:
+                with open(trainer.log_dir / "best.json", "r") as f:
+                    try:
+                        best_log = LogEntry.from_dict(json.load(f))
+                        if best_log != current_best.log:
+                            current_best = BestTrial(
+                                trial_id=trial_id + 1,
+                                log=best_log,
+                            )
+                    except KeyError:
+                        pass
+
+                logger.info(hp_summary_str(trial_id, current_best, rf_params))
+        garbage_collection_cuda()
+
+def run_autotune(
+    gnn_cfg: BackboneConfig,
+    rf_cfg: RFConfig,
+    solver_cfg: SolverConfig,
+    loaders: dict[str, torch.utils.data.DataLoader],
+    scale_by_species: bool,
+    jac_chunk_size: int | Literal["auto"],
+    trainer: BaseTrainer,
+):
+    current_best = BestTrial(None, None)
+    rf_param_grid = create_rf_hpsearch_grid(rf_cfg)
+    solver_param_grid = create_solver_hpsearch_grid(solver_cfg)
+    for trial_id, rf_params in rf_param_grid:
+        logger.debug(f"Autotune iteration with RF parameters {rf_params}")
+
+        assert isinstance(loaders["train"].dataset, BaseAtomsDataset)  # for typing
+        model = FrankenPotential(
+            gnn_config=gnn_cfg,
+            rf_config=rf_params,
+            scale_by_Z=scale_by_species,
+            num_species=loaders["train"].dataset.num_species,
+            atomic_energies=None,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+        logs, weights_mean, weights_sigma = trainer.fit_bayesian(model, solver_param_grid)
+        for split_name, loader in loaders.items():
+            logs = trainer.evaluate(
+                model,
+                loader,
+                logs,
+                weights_mean,
+                weights_sigma,
+                metrics=[
+                    "energy_MAE",
+                    "forces_MAE",
+                    "energy_RMSE",
+                    "forces_RMSE",
+                    "forces_cosim",
+                ],
+            )
+        split_for_best_model = (
+            DataSplit.VALIDATION if "val" in loaders else DataSplit.TRAIN
+        )
+        if dist_utils.get_rank() == 0:
+            if trainer.log_dir is not None:
+                trainer.serialize_logs(model, logs, weights_mean, weights_sigma, split_for_best_model)
         dist_utils.barrier()
 
         # current best model update
