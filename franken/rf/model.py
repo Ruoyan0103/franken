@@ -437,6 +437,7 @@ class FrankenPotential(torch.nn.Module):
         forces_fmap: torch.Tensor,
         weights_mean: Optional[torch.Tensor] = None,
         weights_sigma: Optional[torch.Tensor] = None,
+        beta: float = 1e-6,
         add_energy_shift: bool = True,
     ):
         if weights_mean is None:
@@ -455,12 +456,12 @@ class FrankenPotential(torch.nn.Module):
             dims=([1], [0]),  # type: ignore
         )
 
-        energy_sigma =  torch.einsum('fi,fg,fi->i', X_eng, weights_sigma, X_eng)
-        forces_var = torch.einsum('fac,fg,fbd->abd', X_forces, weights_sigma, X_forces)
+        energy_var =  torch.einsum('fi,fg,fi->i', X_eng, weights_sigma, X_eng)
+        forces_var = torch.einsum('fac,fg,fbd->abd', X_forces, weights_sigma, X_forces) + beta
 
         if add_energy_shift:
             energy = energy + self.energy_shift(data.atomic_numbers)
-        return energy_mean, forces_mean, energy_sigma, forces_var
+        return energy_mean, forces_mean, energy_var, forces_var
 
     def forward(
         self,

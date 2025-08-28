@@ -122,7 +122,7 @@ class RandomFeaturesTrainer(BaseTrainer):
             logs (LogCollection): Logs which contain all parameters related
                 to the fitting, as well as timings.
             weights_mean (torch.Tensor): Mean values for weights which were learned during the fit.
-            weights_sigma (torch.Tensor): Covariance matrix for weights which were learned during the fit.
+            weights_var (torch.Tensor): Covariance matrix for weights which were learned during the fit.
 
         Note:
             More information about the available solver parameters can be found under the
@@ -150,7 +150,7 @@ class RandomFeaturesTrainer(BaseTrainer):
             dtype=self.buffer_dt,
             device=self.device,
         )
-        all_weights_sigma = torch.zeros(
+        all_weights_var = torch.zeros(
             solver_grid_size,
             model.rf.total_random_features,
             dtype=self.buffer_dt,
@@ -169,17 +169,17 @@ class RandomFeaturesTrainer(BaseTrainer):
         for hp_idx, hp_val in solver_iter:
             t_solve_start = perf_counter()
             try:
-                weights_mean, weights_sigma = self.solve_bayesian(**hp_val)
+                weights_mean, weights_var, beta = self.solve_bayesian(**hp_val)
             except torch.linalg.LinAlgError as e:
                 weights_mean = torch.full_like(all_weights_mean[hp_idx], torch.inf)
-                weights_sigma = torch.full_like(all_weights_sigma[hp_idx], torch.inf)
+                weights_var = torch.full_like(all_weights_var[hp_idx], torch.inf)
                 num_failed += 1
                 logger.debug(f"Hyperparameter {hp_val} failed. Error: {e}")
             finally:
                 t_solve = perf_counter() - t_solve_start
             # Update all weights
             all_weights_mean[hp_idx].copy_(weights_mean.view(-1))
-            all_weights_sigma[hp_idx].copy_(weights_sigma.view(-1))
+            all_weights_var[hp_idx].copy_(weights_var.view(-1))
 
             # Logging
             solver_hps = hp_val | {"dtype": self.buffer_dt}
@@ -198,7 +198,7 @@ class RandomFeaturesTrainer(BaseTrainer):
 
         # Broadcast weights and logs
         dist_utils.all_sum(all_weights_mean)
-        dist_utils.all_sum(all_weights_sigma)
+        dist_utils.all_sum(all_weights_var)
         log_collection = LogCollection.gather_from_ranks(local_logs)
         assert len(log_collection) == solver_grid_size
 
@@ -210,7 +210,7 @@ class RandomFeaturesTrainer(BaseTrainer):
                 f"Solver failed in {num_failed.item()}/{solver_grid_size} cases."
             )
 
-        return log_collection, all_weights_mean, all_weights_sigma
+        return log_collection, all_weights_mean, all_weights_var, beta
 
     def fit(
         self,
@@ -324,7 +324,8 @@ class RandomFeaturesTrainer(BaseTrainer):
         dataloader: torch.utils.data.DataLoader,
         log_collection: LogCollection,
         all_weights_mean: torch.Tensor | None,
-        all_weights_sigma: torch.Tensor | None,
+        all_weights_var: torch.Tensor | None,
+        beta: float = 1e-6,
         metrics: Sequence[str] = ("energy_MAE", "forces_MAE", "forces_cosim"),
     ) -> LogCollection:
         if self.device.type == "cuda":
@@ -368,12 +369,13 @@ class RandomFeaturesTrainer(BaseTrainer):
                 assert len(self.forces_fmap) == len(self.energy_fmap)
                 assert len(self.forces_fmap) == len(dataloader)
                 predictions = Target(
-                    *model.energy_and_forces_from_fmaps_bayesian(
+                    *model.energy_and_forces_from_fmaps_bayesian( 
                         data,
                         energy_fmap=self.energy_fmap[i],
                         forces_fmap=self.forces_fmap[i],
                         weights_mean=all_weights_mean,
-                        weights_sigma=all_weights_sigma,
+                        weights_var=all_weights_var,
+                        beta=beta,
                         add_energy_shift=False,  # since it's always train here
                     )
                 )
@@ -386,7 +388,8 @@ class RandomFeaturesTrainer(BaseTrainer):
                     *model.energy_and_forces(
                         data,
                         weights_mean=all_weights_mean,
-                        weights_sigma=all_weights_sigma,
+                        weights_var=all_weights_var,
+                        beta=beta,
                         forces_mode=forces_mode,
                         add_energy_shift=(False if split == DataSplit.TRAIN else True),
                     )
@@ -696,5 +699,5 @@ class RandomFeaturesTrainer(BaseTrainer):
         )
         lerped_cov.diagonal().copy_(lerped_diag)
         rhs = torch.lerp(self.coeffs_energy, self.coeffs_forces, force_weight)
-        weights_mean, weights_sigma = bayesian_linear(lerped_cov, rhs, alpha, beta) 
-        return weights_mean, weights_sigma
+        weights_mean, weights_var = bayesian_linear(lerped_cov, rhs, alpha, beta) 
+        return weights_mean, weights_var, beta

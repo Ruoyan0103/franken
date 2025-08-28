@@ -231,14 +231,15 @@ def run_autotune(
             jac_chunk_size=jac_chunk_size,
         )
 
-        logs, weights_mean, weights_sigma = trainer.fit_bayesian(model, solver_param_grid)
+        logs, weights_mean, weights_sigma, beta = trainer.fit_bayesian(model, solver_param_grid)
         for split_name, loader in loaders.items():
-            logs = trainer.evaluate(
+            logs = trainer.evaluate_bayesian(
                 model,
                 loader,
                 logs,
                 weights_mean,
                 weights_sigma,
+                beta,
                 metrics=[
                     "energy_MAE",
                     "forces_MAE",
